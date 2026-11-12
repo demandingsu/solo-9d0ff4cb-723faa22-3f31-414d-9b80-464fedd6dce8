@@ -27,13 +27,13 @@ def test_next_page_and_detail_links_index():
 
 
 def test_last_page_has_no_next():
-    html = (HTML_DIR / "page3.html").read_text(encoding="utf-8")
-    assert parse_next_page(html, "http://site:8080/page3.html") is None
+    html = (HTML_DIR / "page4.html").read_text(encoding="utf-8")
+    assert parse_next_page(html, "http://site:8080/page4.html") is None
 
 
 def test_offsite_link_absolute_and_detected():
-    html = (HTML_DIR / "page3.html").read_text(encoding="utf-8")
-    links = parse_detail_links(html, "http://site:8080/page3.html")
+    html = (HTML_DIR / "page4.html").read_text(encoding="utf-8")
+    links = parse_detail_links(html, "http://site:8080/page4.html")
     offsite = [u for u, _, _ in links if "external.example.org" in u]
     assert offsite == ["http://external.example.org/notice/N-EXT-001.html"]
     assert not is_same_site(offsite[0], "http://site:8080/index.html")
@@ -70,6 +70,23 @@ def test_parse_multi_reference_detail():
     html = (HTML_DIR / "notices" / "N-2026-011.html").read_text(encoding="utf-8")
     a = parse_detail(html, "http://site:8080/notices/N-2026-011.html")
     assert a.references == ["N-2026-009", "N-2026-999"]
+
+
+def test_parse_correction_before_original_detail():
+    # 更正先于原公告刊登：解析层如实保留发布时间与引用，不做倒置
+    corr = parse_detail(
+        (HTML_DIR / "notices" / "N-2026-015.html").read_text(encoding="utf-8"),
+        "http://site:8080/notices/N-2026-015.html",
+    )
+    assert corr.kind.value == "correction"
+    assert corr.references == ["N-2026-014"]
+    assert corr.published_at.isoformat() == "2026-11-10T16:00:00+08:00"
+    orig = parse_detail(
+        (HTML_DIR / "notices" / "N-2026-014.html").read_text(encoding="utf-8"),
+        "http://site:8080/notices/N-2026-014.html",
+    )
+    assert orig.kind.value == "suspension"
+    assert orig.published_at > corr.published_at
 
 
 def test_missing_id_raises():

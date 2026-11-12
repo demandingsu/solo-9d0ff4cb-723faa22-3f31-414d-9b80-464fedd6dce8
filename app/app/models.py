@@ -77,10 +77,26 @@ class InactiveChain(BaseModel):
 
     root_id: str
     route: str | None
-    reason: str = Field(..., description="cancelled / not_yet_effective / expired / no_interval")
+    reason: str = Field(
+        ...,
+        description=(
+            "cancelled / not_yet_effective / expired / no_interval / "
+            "pending_verification / publication_order_conflict"
+        ),
+    )
     chain: list[str]
     sources: list[str]
     latest_published_at: datetime | None = None
+    # 更正/撤销引用了查询时刻尚未发布的公告：这些未来公告不得列入 chain/sources
+    pending_references: list[str] = Field(
+        default_factory=list,
+        description="查询时刻尚未发布的被引用公告编号（待核实）",
+    )
+    # 发布时间矛盾：后继公告（更正/撤销）早于其引用的公告发布
+    order_conflicts: list[str] = Field(
+        default_factory=list,
+        description="发布时间矛盾的引用对，形如 'N-002 早于其引用的 N-001'",
+    )
 
 
 class UnmatchedReference(BaseModel):

@@ -13,7 +13,9 @@
 | 链顺序 | 引用关系定链，同一节点多个后继按发布时间排序 |
 | 更正替换原停运信息 | 按发布时间依次应用，链上最后一条可见公告的起止/线路为当前生效信息 |
 | 撤销使整条链失效 | 链上出现查询时刻已发布的撤销公告 → `inactive_chains[].reason=cancelled` |
-| 未来公告不可见 | 发布时间晚于查询时刻的公告不参与链还原与判定 |
+| 未来公告不可见 | 发布时间晚于查询时刻的公告不参与链还原与判定，也不得列入来源链 |
+| 更正引用尚未发布的公告 | 更正无法核实引用依据 → `reason=pending_verification`，被引用的未来公告记入 `pending_references` 但不进入 `chain/sources`，更正不得脱离引用单独生效 |
+| 发布时间矛盾 | 更正/撤销早于其引用的公告发布；即使查询时刻双方均已发布，仍标 `reason=publication_order_conflict`（细节见 `order_conflicts`），不倒置修订先后制造有效结论 |
 | 同线路独立公告分别判断 | 每条根公告独立成链；示例中 12 路有两条同时有效的独立停运 |
 | 无法匹配的引用 | 被引用编号在整站不存在时收集到 `unmatched_references`，不影响其余判定 |
 | 同站限制 | 只沿协议+主机+端口一致的链接爬行，跨站链接跳过并在 `skipped_offsite_links` 返回 |
@@ -32,9 +34,9 @@ app/                 FastAPI 采集服务
   app/main.py        POST /query、GET /health
   Dockerfile
 site/                本地示例公告站（数据驱动生成纯静态 HTML）
-  build_site.py      生成 html/（3 个列表页 + 13 条详情，覆盖全部场景）
+  build_site.py      生成 html/（4 个列表页 + 16 条详情，覆盖全部场景）
   Dockerfile         python -m http.server 托管静态站
-tests/               22 个单元/集成测试（pytest）
+tests/               28 个单元/集成测试（pytest）
 demo/                本地与 Compose 演示脚本
 docker-compose.yml   api(8000) + notice-site(8080)
 ```
@@ -85,6 +87,8 @@ python3 -m venv --without-pip .venv
 | N-2026-008 | 5 路停运尚未开始 | `not_yet_effective` |
 | 009 → 011 | 40 路更正，且 011 误引用不存在的 N-2026-999 | 有效，同时报告悬空引用 |
 | N-2026-013 | 50 路整条公告查询时刻之后才发布 | `not_yet_effective` |
+| 015 → 014 | 60 路更正（015，11-10 刊登）先于其引用的原公告（014，11-13 补发） | 查询时刻 014 未发布：`pending_verification`，014 不列为来源；越过 014 发布时间后：`publication_order_conflict`，不倒置修订先后 |
+| N-2026-016 | 60 路另一条独立原公告，与 014/015 无关 | 有效，不受待核实链影响 |
 | N-EXT-001 | 列表中的跨站链接 | 跳过，出现在 `skipped_offsite_links` |
 
 ## 接入真实站点

@@ -3,18 +3,24 @@
 规则（对应业务约定）：
 
 * 每条公告按编号唯一标识；更正/撤销公告通过“引用编号”指向上一条公告，
-  更正也可以引用另一条更正，从而形成链。
-* 链的顺序由引用关系确定，同一节点存在多个后继时按发布时间排序。
+  更正也可以引用另一条更正，从而形成链。链沿引用方向还原：原始公告为根，
+  更正/撤销为后继；同一节点存在多个后继时按发布时间排序。
 * 更正公告携带的停运起止（及线路）替换其之前链上的停运信息；
   链上最后一条非撤销公告的信息即当前生效信息。
 * 撤销公告使它所在的整条链失效。
-* 查询时刻之后才发布的公告在该时刻尚不可见，不参与判定。
+* 查询时刻之后才发布的公告在该时刻尚不可见，不参与判定，也不得作为来源列出。
+* 更正/撤销引用了查询时刻尚未发布的公告时，该更正无法核实其引用依据，
+  相关停运标为“待核实”（pending_verification）：更正不得脱离引用单独生效，
+  被引用的未来公告不进入链与来源列表。
+* 被引用公告在查询时刻之后才发布时，更正客观上早于原公告发布；查询时刻越过
+  原公告发布时间后，这一发布时间矛盾仍然保留（publication_order_conflict），
+  不倒置修订先后去制造“有效”结论。
 * 同一起始公告若出现分叉后继，每个分支独立成链、独立判定；
   不同根公告（同线路的独立公告）天然分别判断。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 from .models import (
@@ -27,22 +33,12 @@ from .models import (
 
 
 @dataclass
-class _Node:
-    announcement: Announcement
-    children: list[str] = field(default_factory=list)  # 引用本公告的后继编号
-
-
-@dataclass
 class ReconstructionResult:
     active: list[ActiveSuspension]
     inactive: list[InactiveChain]
     unmatched: list[UnmatchedReference]
     # 编号 -> 公告（便于测试/诊断）
     by_id: dict[str, Announcement]
-
-
-def _sort_key(published_at: datetime) -> datetime:
-    return published_at
 
 
 def reconstruct(
@@ -69,56 +65,106 @@ def reconstruct(
                     )
                 )
 
-    # 2) 构建后继索引（只连存在的边），并区分查询时刻可见/不可见
-    nodes: dict[str, _Node] = {nid: _Node(a) for nid, a in by_id.items()}
-    for a in by_id.values():
-        for ref in a.references:
-            if ref in nodes:
-                nodes[ref].children.append(a.notice_id)
-    for node in nodes.values():
-        node.children.sort(key=lambda cid: _sort_key(by_id[cid].published_at))
-
     visible = {nid for nid, a in by_id.items() if a.published_at <= query_time}
 
-    # 3) 根 = 不引用任何“查询时刻已发布且存在”的公告的节点（链的出边起点）。
-    #    悬空引用（编号不存在）与指向未来公告的引用不阻止其成为根。
-    def has_visible_existing_ref(a: Announcement) -> bool:
-        return any(
-            ref in by_id and by_id[ref].published_at <= query_time
-            for ref in a.references
-        )
+    # 2) 后继索引：引用本公告的可见公告（链上的后继）。指向未来公告的引用
+    #    不挂边，因此更正/撤销在其依据尚未发布时仍是一条链的末端（叶子）。
+    successors: dict[str, list[str]] = {nid: [] for nid in by_id}
+    for a in by_id.values():
+        if a.notice_id not in visible:
+            continue
+        for ref in a.references:
+            if ref in visible:
+                successors[ref].append(a.notice_id)
+    for kids in successors.values():
+        kids.sort(key=lambda cid: (by_id[cid].published_at, cid))
 
-    roots = [nid for nid, a in by_id.items() if not has_visible_existing_ref(a)]
-    roots.sort(key=lambda nid: (by_id[nid].published_at, nid))
+    # 3) 对每条公告区分：
+    #    visible_refs —— 查询时刻已发布且存在的引用（链上的前驱/父节点）；
+    #    future_refs  —— 查询时刻尚未发布的现存引用（待核实依据，不进入链）。
+    def split_refs(a: Announcement) -> tuple[list[str], list[str]]:
+        visible_refs: list[str] = []
+        future_refs: list[str] = []
+        for ref in a.references:
+            if ref not in by_id:
+                continue  # 悬空引用已在 unmatched 中报告
+            if by_id[ref].published_at <= query_time:
+                visible_refs.append(ref)
+            else:
+                future_refs.append(ref)
+        return visible_refs, future_refs
 
     active: list[ActiveSuspension] = []
     inactive: list[InactiveChain] = []
+    # 被可见公告引用的未来公告：已通过“待核实”链解释，不再独立成链
+    consumed_future: set[str] = set()
 
     def walk(path: list[str], seen: set[str]) -> None:
+        # 从链末端公告沿引用方向向上还原，翻转为“根在前、后继在后”的链顺序
         tail = path[-1]
-        # 查询时刻之后才发布的后继公告当时尚不可见，不进入链
-        kids = [c for c in nodes[tail].children if c not in seen and c in visible]
-        if not kids:
-            evaluate_chain(path)
+        refs, _future = split_refs(by_id[tail])
+        refs = [r for r in refs if r not in seen]
+        refs.sort(key=lambda rid: (by_id[rid].published_at, rid))
+        if not refs:
+            evaluate_chain(list(reversed(path)))
             return
-        for kid in kids:  # 已按发布时间排序
-            walk(path + [kid], seen | {kid})
+        for ref in refs:
+            walk(path + [ref], seen | {ref})
+
+    # 4) 叶子 = 查询时刻可见、且没有可见后继引用它的公告。每条引用链从其
+    #    末端开始还原；指向未来公告的边不挂接，相关更正以叶子身份进入待核实。
+    leaves = [nid for nid in visible if not successors[nid]]
+    leaves.sort(key=lambda nid: (by_id[nid].published_at, nid))
 
     def evaluate_chain(chain_ids: list[str]) -> None:
-        chain_ann = [by_id[i] for i in chain_ids]
+        chain_ann = [by_id[i] for i in chain_ids]  # 全部为查询时刻可见公告
         sources = [a.url for a in chain_ann]
         root = chain_ann[0]
+        latest_pub = max(a.published_at for a in chain_ann)
 
-        # 整条链在查询时刻都还未发布
-        if not any(i in visible for i in chain_ids):
+        # 4a) 链上任何公告引用了查询时刻尚未发布的公告 -> 待核实。
+        #     未来公告不得进入 chain/sources，更正也不能脱离引用单独生效。
+        pending_refs: list[str] = []
+        for a in chain_ann:
+            for ref in a.references:
+                if (
+                    ref in by_id
+                    and by_id[ref].published_at > query_time
+                    and ref not in pending_refs
+                ):
+                    pending_refs.append(ref)
+                    consumed_future.add(ref)
+        if pending_refs:
             inactive.append(
                 InactiveChain(
                     root_id=root.notice_id,
-                    route=root.route,
-                    reason="not_yet_effective",
+                    route=_current_route(chain_ann),
+                    reason="pending_verification",
                     chain=chain_ids,
                     sources=sources,
-                    latest_published_at=max(a.published_at for a in chain_ann),
+                    latest_published_at=latest_pub,
+                    pending_references=pending_refs,
+                )
+            )
+            return
+
+        # 4b) 发布时间矛盾：后继公告（更正/撤销）早于它引用的已发布公告。
+        #     即使查询时刻已越过双方发布时间，矛盾仍保留，不倒置修订先后。
+        conflicts: list[str] = []
+        for a in chain_ann:
+            for ref in a.references:
+                if ref in by_id and by_id[ref].published_at > a.published_at:
+                    conflicts.append(f"{a.notice_id} 早于其引用的 {ref}")
+        if conflicts:
+            inactive.append(
+                InactiveChain(
+                    root_id=root.notice_id,
+                    route=_current_route(chain_ann),
+                    reason="publication_order_conflict",
+                    chain=chain_ids,
+                    sources=sources,
+                    latest_published_at=latest_pub,
+                    order_conflicts=conflicts,
                 )
             )
             return
@@ -143,7 +189,7 @@ def reconstruct(
             return
 
         # 按发布时间依次应用更正，后者替换前者的停运信息
-        route, start, end, latest_pub = _current_interval(chain_ann, query_time)
+        route, start, end, latest_published = _current_interval(chain_ann, query_time)
         if start is None or end is None:
             inactive.append(
                 InactiveChain(
@@ -152,7 +198,7 @@ def reconstruct(
                     reason="no_interval",
                     chain=chain_ids,
                     sources=sources,
-                    latest_published_at=latest_pub,
+                    latest_published_at=latest_published,
                 )
             )
             return
@@ -173,7 +219,7 @@ def reconstruct(
                     reason=reason,
                     chain=chain_ids,
                     sources=sources,
-                    latest_published_at=latest_pub,
+                    latest_published_at=latest_published,
                 )
             )
         else:
@@ -184,7 +230,7 @@ def reconstruct(
                     suspend_end=end,
                     source_chain=chain_ids,
                     sources=sources,
-                    published_at=latest_pub,
+                    published_at=latest_published,
                 )
             )
 
@@ -215,8 +261,25 @@ def reconstruct(
                 end = a.suspend_end
         return route, start, end, latest_pub
 
-    for root_id in roots:
-        walk([root_id], {root_id})
+    # 仅遍历查询时刻可见的叶子；不可见节点之间的边在该时刻不产生结论
+    for leaf_id in leaves:
+        walk([leaf_id], {leaf_id})
+
+    # 5) 未被任何可见公告引用的未来公告：在查询时刻尚不可见，
+    #    独立标记为 not_yet_effective（保持既有时间门控语义）
+    for nid, a in by_id.items():
+        if nid in visible or nid in consumed_future:
+            continue
+        inactive.append(
+            InactiveChain(
+                root_id=nid,
+                route=a.route,
+                reason="not_yet_effective",
+                chain=[nid],
+                sources=[a.url],
+                latest_published_at=a.published_at,
+            )
+        )
 
     active.sort(key=lambda x: (x.route, x.suspend_start))
     inactive.sort(key=lambda x: (x.root_id, tuple(x.chain)))
